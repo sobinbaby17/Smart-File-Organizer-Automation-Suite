@@ -108,11 +108,15 @@ def organize_file(file_path, root_folder, run_id, use_creation_date=False):
     return dest_path
 
 
-def organize_folder(source_folder, root_folder, use_creation_date=False, run_id=None):
+def organize_folder(source_folder, root_folder, use_creation_date=False, run_id=None, progress_callback=None):
     """
     Scan source_folder (non-recursive) and organize every file in it into
     root_folder's Type/Year/Month/Week/Day hierarchy.
     Returns (run_id, list_of_moved_pairs, skipped_count).
+
+    progress_callback, if given, is called as progress_callback(done, total)
+    after each file is processed -- used to drive a progress bar in the GUI.
+    This is optional so existing callers are unaffected.
     """
     is_valid, error = validate_source_dest(source_folder, root_folder)
     if not is_valid:
@@ -128,12 +132,16 @@ def organize_folder(source_folder, root_folder, use_creation_date=False, run_id=
     if not folder.exists():
         return run_id, moved, skipped
 
-    for entry in folder.iterdir():
-        if entry.is_file():
-            dest = organize_file(str(entry), root_folder, run_id, use_creation_date)
-            if dest:
-                moved.append((str(entry), dest))
-            else:
-                skipped += 1
+    entries = [e for e in folder.iterdir() if e.is_file()]
+    total = len(entries)
+
+    for i, entry in enumerate(entries, start=1):
+        dest = organize_file(str(entry), root_folder, run_id, use_creation_date)
+        if dest:
+            moved.append((str(entry), dest))
+        else:
+            skipped += 1
+        if progress_callback:
+            progress_callback(i, total)
 
     return run_id, moved, skipped

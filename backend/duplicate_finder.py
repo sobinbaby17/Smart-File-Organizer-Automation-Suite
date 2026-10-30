@@ -27,13 +27,17 @@ def hash_file(file_path, block_size=65536):
     return sha256.hexdigest()
 
 
-def scan_for_duplicates(folder_path):
+def scan_for_duplicates(folder_path, progress_callback=None):
     """
     Scan a folder and group files by identical content hash.
     Returns (duplicate_groups, errors):
       duplicate_groups: { hash_value: [list of file paths with that hash] }
         (only hashes with more than 1 file are included)
       errors: list of human-readable strings for any file that could not be read
+
+    progress_callback, if given, is called as progress_callback(done, total)
+    after each file is processed -- used to drive a progress bar in the GUI.
+    This is optional so existing callers are unaffected.
     """
     folder = Path(folder_path)
     if not folder.exists():
@@ -42,17 +46,24 @@ def scan_for_duplicates(folder_path):
     hashes = {}
     errors = []
 
-    for entry in folder.iterdir():
-        if not entry.is_file():
-            continue
+    entries = [e for e in folder.iterdir() if e.is_file()]
+    total = len(entries)
+
+    for i, entry in enumerate(entries, start=1):
         if not is_file_safe_to_touch(str(entry)):
+            if progress_callback:
+                progress_callback(i, total)
             continue
         try:
             file_hash = hash_file(entry)
         except (PermissionError, OSError) as e:
             errors.append(f"Could not read '{entry}': {e}")
+            if progress_callback:
+                progress_callback(i, total)
             continue
         hashes.setdefault(file_hash, []).append(str(entry))
+        if progress_callback:
+            progress_callback(i, total)
 
     duplicate_groups = {h: paths for h, paths in hashes.items() if len(paths) > 1}
     return duplicate_groups, errors

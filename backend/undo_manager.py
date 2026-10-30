@@ -179,5 +179,3 @@ def undo_action_by_id(action_id):
     if success:
         return True, f"Restored '{row['dest_path']}' -> '{row['source_path']}'"
     return False, f"Could not restore -- file missing at '{row['dest_path']}'"
-
-def undo_all_rulle()

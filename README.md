@@ -7,7 +7,7 @@ and lets you undo any action it takes.
 ## Project Structure
 
 ```
-final_project/
+Smart-File-Organizer-Automation-Suite/
 ├── main.py                     Entry point -- run this to launch the app
 ├── requirements.txt
 ├── backend/
@@ -34,10 +34,11 @@ final_project/
 
 2. Install the one dependency (PyQt6):
    ```bash
-   pip install -r requirements.txt --break-system-packages
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
    ```
-   (On some systems you can drop `--break-system-packages`, or use a virtual
-   environment: `python3 -m venv venv && source venv/bin/activate` first.)
+   (On Ubuntu/Debian, if the venv command fails, first run `sudo apt install python3-venv`.)
 
 3. Run the app:
    ```bash
@@ -66,6 +67,13 @@ final_project/
   or on a schedule.
 - **Dashboard tab**: summary counts, and a Start/Stop button for the
   background scheduler (checks every 30 seconds for anything due to run).
+
+**Progress bar:** scanning for duplicates, running Auto Organize, and
+running a backup all show a progress bar at the bottom of the window while
+they work, and the triggering button is disabled until they finish. The
+window stays fully responsive during this -- you can still switch tabs --
+since these operations run on a background thread rather than freezing
+the interface.
 
 ## Real-World Safety Features
 
@@ -100,16 +108,15 @@ symlinks, locked files, accidental dangerous folder selection):
   permanently emptying quarantine -- both irreversible-ish actions now
   require explicit confirmation.
 
-## Known Limitations (Honest, for your report)
+## Known Limitations
 
-- The scheduler only runs while the app is open (see "Future Enhancements"
-  in the Need of the Project document for the OS-level service alternative).
+- The scheduler only runs while the app is open (running it as an OS-level background service is a possible future enhancement).
 - Backups are full snapshots, not incremental, and old backups are not
   automatically cleaned up.
 - Rule matching supports one extension + one optional keyword per rule --
   not full wildcard/regex patterns yet.
 
-## Design Notes (for your report / viva)
+## Design Notes
 
 - **Layered architecture**: `backend/` contains all business logic and has
   no dependency on PyQt6 -- it can be tested and reused independently of the
@@ -131,6 +138,15 @@ symlinks, locked files, accidental dangerous folder selection):
   noted as a future enhancement (real-time monitoring via `watchdog`).
 - **Single shared database** (`organizer.db`, created automatically on first
   run) ties rules, backups, and the activity log together.
+- **Long operations run on a background thread**: scanning for duplicates,
+  Auto Organize's "Organize Now", and running a backup all execute on a
+  `QThread` (see `BackgroundTask` in `gui/main_window.py`) instead of the
+  main GUI thread. This keeps the window responsive and avoids the OS
+  showing a "Not Responding" prompt during large operations, and drives a
+  progress bar showing how many files have been processed so far. The
+  relevant backend functions (`scan_for_duplicates`, `organize_folder`,
+  `create_backup` / `run_backup_job`) accept an optional `progress_callback`
+  parameter for this purpose -- existing calls without it are unaffected.
 
 ## Testing Notes
 

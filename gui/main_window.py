@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox,
     QCheckBox, QTableWidget, QTableWidgetItem, QMessageBox, QGroupBox,
-    QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem
+    QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem, QProgressBar
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 
 from backend.database import init_db
 from backend.rule_engine import save_rule, get_all_rules, delete_rule, run_rule_by_id
@@ -34,6 +34,37 @@ from backend.scheduler import Scheduler
 from backend.safety import validate_source_dest
 from backend.auto_organizer import organize_folder, CATEGORY_MAP, DEFAULT_CATEGORY
 from backend.folder_monitor import FolderMonitor
+
+
+class BackgroundTask(QThread):
+    """
+    Runs any backend function that accepts a progress_callback kwarg on a
+    separate thread, so slow operations (scanning thousands of files,
+    zipping a large folder) don't freeze the window and trigger the OS's
+    "Not Responding" prompt.
+
+    Usage: BackgroundTask(some_function, arg1, arg2, kwarg1=value)
+    The function MUST accept progress_callback=... as one of its keyword
+    arguments (all three slow backend functions in this app do).
+    """
+    progress = pyqtSignal(int, int)   # done, total
+    finished_ok = pyqtSignal(object)  # whatever the function returned
+    failed = pyqtSignal(str)          # error message
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            def report(done, total):
+                self.progress.emit(done, total)
+            result = self.fn(*self.args, progress_callback=report, **self.kwargs)
+            self.finished_ok.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class FolderPicker(QWidget):
@@ -197,18 +228,19 @@ class RulesTab(QWidget):
 # ----------------------------------------------------------- Duplicates Tab
 
 class DuplicatesTab(QWidget):
-    def __init__(self, status_callback):
+    def __init__(self, status_callback, run_background):
         super().__init__()
         self.status_callback = status_callback
+        self.run_background = run_background
         self.last_groups = {}
         layout = QVBoxLayout()
 
         scan_row = QHBoxLayout()
         self.folder_picker = FolderPicker("Folder to scan for duplicates")
-        scan_btn = QPushButton("Scan for Duplicates")
-        scan_btn.clicked.connect(self.scan)
+        self.scan_btn = QPushButton("Scan for Duplicates")
+        self.scan_btn.clicked.connect(self.scan)
         scan_row.addWidget(self.folder_picker)
-        scan_row.addWidget(scan_btn)
+        scan_row.addWidget(self.scan_btn)
         layout.addLayout(scan_row)
 
         self.list_widget = QListWidget()
@@ -216,9 +248,9 @@ class DuplicatesTab(QWidget):
         layout.addWidget(QLabel("Duplicate files found (first file in each group is kept automatically):"))
         layout.addWidget(self.list_widget)
 
-        quarantine_btn = QPushButton("Quarantine Duplicates (Safe, Undoable)")
-        quarantine_btn.clicked.connect(self.quarantine)
-        layout.addWidget(quarantine_btn)
+        self.quarantine_btn = QPushButton("Quarantine Duplicates (Safe, Undoable)")
+        self.quarantine_btn.clicked.connect(self.quarantine)
+        layout.addWidget(self.quarantine_btn)
 
         quarantine_box = QGroupBox("Quarantine Folder")
         q_layout = QVBoxLayout()
@@ -266,7 +298,15 @@ class DuplicatesTab(QWidget):
             QMessageBox.warning(self, "Invalid folder", "Please choose a valid folder to scan.")
             return
 
-        self.last_groups, errors = scan_for_duplicates(folder)
+        self.run_background(
+            scan_for_duplicates, args=(folder,),
+            on_success=self._on_scan_finished,
+            trigger_button=self.scan_btn,
+            label="Scanning",
+        )
+
+    def _on_scan_finished(self, result):
+        self.last_groups, errors = result
         self.list_widget.clear()
 
         if errors:
@@ -367,9 +407,10 @@ class ActivityLogTab(QWidget):
 # -------------------------------------------------------------- Backup Tab
 
 class BackupTab(QWidget):
-    def __init__(self, status_callback):
+    def __init__(self, status_callback, run_background):
         super().__init__()
         self.status_callback = status_callback
+        self.run_background = run_background
         layout = QVBoxLayout()
 
         form_box = QGroupBox("New Backup Job")
@@ -397,13 +438,13 @@ class BackupTab(QWidget):
         layout.addWidget(self.table)
 
         btn_row = QHBoxLayout()
-        run_btn = QPushButton("Run Selected Now")
-        run_btn.clicked.connect(self.run_selected)
+        self.run_btn = QPushButton("Run Selected Now")
+        self.run_btn.clicked.connect(self.run_selected)
         delete_btn = QPushButton("Delete Selected")
         delete_btn.clicked.connect(self.delete_selected)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh)
-        btn_row.addWidget(run_btn)
+        btn_row.addWidget(self.run_btn)
         btn_row.addWidget(delete_btn)
         btn_row.addWidget(refresh_btn)
         layout.addLayout(btn_row)
@@ -451,7 +492,16 @@ class BackupTab(QWidget):
         if job_id is None:
             QMessageBox.information(self, "No selection", "Select a backup job first.")
             return
-        archive_path, errors = run_backup_job(job_id)
+
+        self.run_background(
+            run_backup_job, args=(job_id,),
+            on_success=self._on_backup_finished,
+            trigger_button=self.run_btn,
+            label="Backing up",
+        )
+
+    def _on_backup_finished(self, result):
+        archive_path, errors = result
         if errors and not archive_path:
             QMessageBox.critical(self, "Backup failed", "\n".join(errors))
             self.status_callback("Backup failed.")
@@ -482,9 +532,10 @@ class AutoOrganizeTab(QWidget):
     Supports one-time "Organize Now" and continuous background monitoring.
     """
 
-    def __init__(self, status_callback):
+    def __init__(self, status_callback, run_background):
         super().__init__()
         self.status_callback = status_callback
+        self.run_background = run_background
         self.monitor = None
         layout = QVBoxLayout()
 
@@ -499,9 +550,9 @@ class AutoOrganizeTab(QWidget):
         form.addRow("Organized root folder:", self.root_picker)
         form.addRow("", self.use_creation_date)
 
-        organize_now_btn = QPushButton("Organize Now (one-time)")
-        organize_now_btn.clicked.connect(self.organize_now)
-        form.addRow("", organize_now_btn)
+        self.organize_now_btn = QPushButton("Organize Now (one-time)")
+        self.organize_now_btn.clicked.connect(self.organize_now)
+        form.addRow("", self.organize_now_btn)
 
         form_box.setLayout(form)
         layout.addWidget(form_box)
@@ -539,14 +590,17 @@ class AutoOrganizeTab(QWidget):
             QMessageBox.warning(self, "Invalid folder", f"Source folder does not exist:\n{source}")
             return
 
-        try:
-            run_id, moved, skipped = organize_folder(
-                source, root, use_creation_date=self.use_creation_date.isChecked()
-            )
-        except ValueError as e:
-            QMessageBox.warning(self, "Blocked", str(e))
-            return
+        self.run_background(
+            organize_folder, args=(source, root),
+            kwargs={"use_creation_date": self.use_creation_date.isChecked()},
+            on_success=self._on_organize_finished,
+            on_error=lambda msg: QMessageBox.warning(self, "Blocked", msg),
+            trigger_button=self.organize_now_btn,
+            label="Organizing",
+        )
 
+    def _on_organize_finished(self, result):
+        run_id, moved, skipped = result
         self.status_callback(f"Organized {len(moved)} file(s), skipped {skipped}. (Run ID: {run_id})")
 
     def toggle_monitor(self):
@@ -644,16 +698,22 @@ class MainWindow(QMainWindow):
 
         init_db()
         self.scheduler = Scheduler(on_event=self.show_status)
+        self._active_tasks = []  # keeps QThread objects alive while running
 
         self.status_label = QLabel("Ready.")
         self.status_label.setStyleSheet("padding: 6px; color: #2F5496; font-weight: bold;")
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(18)
+
         self.tabs = QTabWidget()
         self.rules_tab = RulesTab(self.show_status)
-        self.duplicates_tab = DuplicatesTab(self.show_status)
-        self.auto_organize_tab = AutoOrganizeTab(self.show_status)
+        self.duplicates_tab = DuplicatesTab(self.show_status, self.run_background)
+        self.auto_organize_tab = AutoOrganizeTab(self.show_status, self.run_background)
         self.activity_tab = ActivityLogTab(self.show_status)
-        self.backup_tab = BackupTab(self.show_status)
+        self.backup_tab = BackupTab(self.show_status, self.run_background)
         self.dashboard_tab = DashboardTab(self.scheduler, self.show_status)
 
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
@@ -669,6 +729,7 @@ class MainWindow(QMainWindow):
         container = QWidget()
         main_layout = QVBoxLayout()
         main_layout.addWidget(self.tabs)
+        main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.status_label)
         container.setLayout(main_layout)
         self.setCentralWidget(container)
@@ -677,6 +738,57 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.dashboard_tab.refresh)
         self.refresh_timer.start(5000)
+
+    def run_background(self, fn, args=(), kwargs=None, on_success=None, on_error=None,
+                        trigger_button=None, label="Working"):
+        """
+        Runs fn(*args, progress_callback=..., **kwargs) on a background QThread
+        so the window never freezes/shows "Not Responding" during slow
+        operations like scanning thousands of files or zipping a large folder.
+
+        trigger_button, if given, is disabled while the task runs and
+        re-enabled afterwards, to prevent double-clicking Start.
+        """
+        kwargs = kwargs or {}
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(1)
+        self.progress_bar.setVisible(True)
+        if trigger_button:
+            trigger_button.setEnabled(False)
+
+        task = BackgroundTask(fn, *args, **kwargs)
+
+        def _on_progress(done, total):
+            self.progress_bar.setMaximum(max(total, 1))
+            self.progress_bar.setValue(done)
+            self.show_status(f"{label}... {done}/{total}")
+
+        def _cleanup():
+            self.progress_bar.setVisible(False)
+            if trigger_button:
+                trigger_button.setEnabled(True)
+            if task in self._active_tasks:
+                self._active_tasks.remove(task)
+
+        def _on_finished(result):
+            _cleanup()
+            if on_success:
+                on_success(result)
+
+        def _on_failed(msg):
+            _cleanup()
+            if on_error:
+                on_error(msg)
+            else:
+                QMessageBox.critical(self, "Error", msg)
+
+        task.progress.connect(_on_progress)
+        task.finished_ok.connect(_on_finished)
+        task.failed.connect(_on_failed)
+
+        self._active_tasks.append(task)  # prevent garbage collection mid-run
+        task.start()
 
     def on_tab_changed(self, index):
         widget = self.tabs.widget(index)
